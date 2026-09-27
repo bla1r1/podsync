@@ -1,4 +1,3 @@
-"""Room plumbing: make the room root importable so `import podsync` works."""
 
 import sys
 from pathlib import Path

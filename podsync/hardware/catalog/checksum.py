@@ -13,7 +13,7 @@ class SignatureKind(IntEnum):
     NONE = 0  # pre-2007 models: no signature
     HASH58 = 1  # Classic, nano 3G/4G
     HASH72 = 2  # nano 5G
-    HASHAB = 3  # nano 6G/7G (not supported here)
+    HASHAB = 3  # nano 6G/7G
     UNSUPPORTED = 98
     UNKNOWN = 99  # the model could not be identified
 

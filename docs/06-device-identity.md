@@ -477,7 +477,7 @@ Meaning of the less obvious fields:
 | `supports_photo`, `photo_formats` | Photo-database formats; photos are out of scope, the values are data only. |
 | `music_dirs` | Number of `Fxx` folders under `iPod_Control/Music`. |
 | `max_database_bytes` | Ceiling for the database file size used by the writer's preflight. |
-| `uses_sqlite_db` | Firmware reads SQLite databases; podsync refuses to write such devices (chapter 08 §7.3.3). |
+| `uses_sqlite_db` | Firmware reads SQLite databases; `save_device_library` routes such devices to `podsync.itdb.sqlite` instead of the classic writer (chapter 04 §6.5, chapter 08 §7.3.3). |
 | `db_version` | Minimum database version the writer emits (chapter 04 §5.1); also selects the MHIT header size. |
 | `byte_order` | Always `"le"` for the models in the table. |
 | `max_video_*`, `h264_level` | Video decode limits; data only (transcoding is out of scope). |
@@ -1445,14 +1445,32 @@ found → `None`.
 
 ### 14.3 `vpd_iokit` (macOS only)
 
-Importing the module anywhere but macOS raises
-`ImportError("podsync.device.vpd_iokit is macOS-only")`. It talks to
-services matching `com_apple_driver_iPodSBCNub` through the SCSI task
-interface of IOKit (CoreFoundation and IOKit frameworks via ctypes), walks up
-to 10 registry parents for USB VID/PID/serial, and reads pages as above plus
-page 0x80 into `vpd_serial`. `query_ipod_vpd(usb_pid=0, serial_filter="")`
-returns the first matching iPod's dict (`_source` `scsi_vpd`, `_transport`
-`iokit_scsi_vpd`) or `None`; `query_all_ipods()` returns all.
+Loading CoreFoundation/IOKit via ctypes is best-effort: on any platform
+where the libraries aren't found (or `ctypes.util.find_library` fails), the
+module still imports cleanly and every function is a silent no-op
+(`query_all_ipods()` → `[]`, `query_ipod_vpd()` → `None`) — there is no
+`ImportError` guard.
+
+Two ways to reach a usable `SCSITaskDeviceInterface`, tried in order:
+
+1. Services matching `com_apple_driver_iPodSBCNub` — Apple's iPod-specific
+   companion driver, found via `IOServiceMatching`/`IOServiceGetMatchingServices`.
+   Walks up to 10 registry parents from there for USB VID/PID/serial.
+2. Fallback, used when no SBCNub instance matches: the mounted BSD whole
+   disk's ancestor service that advertises the `SCSITaskDeviceUserClient`
+   plugin (the same nub the in-kernel mass-storage driver uses).
+
+Either way, one `SCSITask` is created per device and reused for every
+INQUIRY (standard inquiry, page 0x80 into `vpd_serial`, then the VPD data
+pages as above); each reuse is preceded by `ResetForNewTask`. Path 2's
+`CreateSCSITask` legitimately returns `NULL` while the volume's mass-storage
+driver already holds the device — that device is skipped rather than
+fought over; nothing is unmounted or forced.
+
+`query_ipod_vpd(usb_pid=0, serial_filter="")` returns the first matching
+iPod's dict (`_source` `ioreg_scsi`, `_transport` `iokit_scsi_task`) or
+`None`; `query_all_ipods()` returns all reachable via path 1, or path 2 if
+path 1 found nothing.
 
 ### 14.4 `vpd_usb_control` — Apple vendor request
 
@@ -1677,4 +1695,6 @@ PyUSB is installed, and the process-wide current-device store.
   SysInfoExtended payloads on the device.
 * **No device images/colors** (`images` module, `MODEL_IMAGE`, `COLOR_MAP`,
   …): `DeviceInfo.icon` is the emoji of §7.1.
-* No GUI, application, podcast, SQLite writer or transcoder imports.
+* No GUI, application, podcast or transcoder imports. (The SQLite database
+  writer, `podsync.itdb.sqlite`, is implemented — see chapter 04 §6.5 — this
+  chapter just never imports it.)

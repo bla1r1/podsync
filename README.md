@@ -10,6 +10,9 @@ everything is produced byte-for-byte the way the device itself expects.
 
 - Parses and writes iTunesDB (tracks, playlists, smart playlists, play
   counts, on-the-go lists) and ArtworkDB (`.ithmb` artwork chunks).
+- Writes the SQLite `iTunes Library.itlp` database family iPod nano 5G-7G
+  use instead of the classic iTunesDB (`podsync/itdb/sqlite/`) — write-only,
+  no reader.
 - Discovers connected iPods on macOS, Windows and Linux, identifies the
   model/generation from USB, SCSI VPD and on-device SysInfo evidence, and
   enforces write-safety checks before touching a device.
@@ -31,11 +34,14 @@ and iPod Touch/iPhone (those use a different sync protocol entirely).
 ## Requirements
 
 - Python 3, `pip install -r requirements.txt` (pytest, pycryptodome,
-  pillow, pyusb — see that file for exact versions; nothing else is used
-  by the package itself).
+  pillow, pyusb, wasmtime — see that file for exact versions; nothing else
+  is used by the package itself).
 - The macOS USB-vendor VPD path additionally needs a libusb-1.0 library
   on the system (e.g. `brew install libusb`); it degrades gracefully to
   "unavailable" without one.
+- Signing a database for iPod nano 6G/7G (HASHAB) runs a vendored
+  WebAssembly module through `wasmtime`; every other device is unaffected
+  if that path is never used.
 
 ## Running the tests
 

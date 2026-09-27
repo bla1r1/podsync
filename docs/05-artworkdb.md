@@ -9,7 +9,7 @@ otherwise. All offsets in field tables are **relative to the start of the chunk*
 (i.e. relative to `offset` in the parser functions).
 
 Dependencies allowed for these modules: Python standard library and **Pillow**
-(`PIL`). `numpy` and `mutagen` are *not* available in this room — every algorithm
+(`PIL`). `numpy` and `mutagen` are *not* available in this project — every algorithm
 below is specified arithmetically so it can be implemented with Pillow/struct/
 plain Python while remaining bit-exact for packed formats (see §9.9 for the
 tolerance on YUV formats).
@@ -1115,7 +1115,7 @@ _VIDEO_EXTS = (".m4v", ".mp4", ".mov", ".mkv", ".avi", ".webm", ".wmv",
 `mutagen` import is wrapped in `try/except ImportError`; on failure set
 `MUTAGEN_AVAILABLE = False` and log
 `WARNING "mutagen not installed - art extraction disabled"` at import time.
-**mutagen is not installed in this room**, so all tag paths below return
+**mutagen is not installed in this project**, so all tag paths below return
 `None` here — implement them with lazy `from mutagen…` imports so the module
 still imports cleanly and the folder/image paths work.
 
@@ -1636,7 +1636,7 @@ These must **not** be implemented in this chapter's modules:
 4. **Photo-database features**: `mhba`/`mhia` album parsing beyond returning
    `{}`, and `podsync.device.artwork.photo_formats_for_device` (chapter 06's
    concern) — ArtworkDB here carries music artwork only (`mhla` is written empty).
-5. **mutagen-dependent tag parsing is present in spec but inert** in this room
+5. **mutagen-dependent tag parsing is present in spec but inert** in this project
    (dependency not installed): those paths return `None` via the
    `MUTAGEN_AVAILABLE` guard; do not vendor or reimplement ID3/MP4 parsing by
    hand.

@@ -46,8 +46,10 @@ The specification of these layouts is split across chapters:
 
 ## 2. Package layout (exact — tests import these paths)
 
-The implementer must create every file below. Module paths in the tests
-are `podsync.<path with / replaced by .>` minus `.py`.
+The chapters below describe the original spec's module layout; see
+`docs/00-layout-map.md` for how it maps onto the actual package (`itdb`,
+`artwork`, `hardware`, `library`). Module paths in the tests are
+`podsync.<path with / replaced by .>` minus `.py`.
 
 ```
 podsync/
@@ -205,57 +207,61 @@ for layout constants of iTunesDB chunks.
 
 * Python 3.11+.
 * Allowed third-party packages: **pycryptodome** (AES for hash 72),
-  **pillow** (image work in the artwork pipeline), **pytest** (tests).
+  **pillow** (image work in the artwork pipeline), **pyusb** (USB vendor
+  SysInfoExtended queries on macOS/Windows), **wasmtime** (running the
+  vendored HASHAB WebAssembly module, chapter 04 §6.4), **pytest** (tests).
   Everything else must be stdlib.
-* Platform code (Windows/macOS/Linux) must guard platform-only and
-  optional imports (libusb/pyusb, IOKit) so that importing `podsync.device`
-  works on any platform without extra packages.
+* pyusb is a real dependency (`requirements.txt`), but the *libusb backend
+  itself* is still optional at runtime: platform code (Windows/macOS/Linux)
+  guards the actual USB and IOKit calls so that importing `podsync.device`
+  and running without a live device works even when no libusb library is
+  installed on the system.
+* **wasmtime** is likewise real in `requirements.txt`, needed only when
+  actually signing a HASHAB (nano 6G/7G) database; every other write path is
+  unaffected if it is missing, and that one path surfaces a clear
+  `ImportError` instead of crashing.
 * **mutagen** is an *optional* runtime package: `art_extractor` imports it
   lazily to read covers embedded in audio files (chapter 05 §11). It is not
-  installed in this room, so only image files and folder art are testable
+  installed in this project, so only image files and folder art are testable
   here; with mutagen installed (as in the host application) embedded MP3/MP4
   covers work too. Nothing else may depend on it.
 * No network access anywhere in the package.
 
-## 5. Out of scope (do not implement)
+## 5. Out of scope
 
 These exist in the surrounding ecosystem but are deliberately absent from
 podsync. Call sites must simply not exist, or — where the surrounding
 logic implies an entry point — raise a clear `NotImplementedError`/
 `RuntimeError` explaining the feature is unsupported:
 
-1. **SQLite databases** for iPod nano 5G–7G (`write_sqlite_databases`
-   and everything around it). Only the classic iTunesDB file family is
-   written. `write_database` on such a device must fail with a clear
-   unsupported-device error.
-2. **`pc_track_to_info`** — conversion from a PC-library track record
+1. **`pc_track_to_info`** — conversion from a PC-library track record
    (the PC library scanner itself is not part of podsync).
-3. **`commit_playcounts_if_needed` / `_commit_playcounts_guarded`** —
-   committing play counts as a separate step. `playcounts.py` parsing
-   and merging during a full read stays in scope.
-4. **The ffmpeg/transcoder branch inside `art_extractor`** — cover
+2. **The ffmpeg/transcoder branch inside `art_extractor`** — cover
    extraction from audio files, folder images and the embedded `covr` of
    m4v/mp4/mov video stays; nothing grabs a video frame or shells out to
    a transcoder. A video without an embedded cover gets no artwork
    (`extract_art` returns `None`, never raises).
-5. **Database hash “AB”** (iPod nano 6G/7G). `hashab.compute_hashab` /
-   `write_hashab` raise `NotImplementedError`, and a write for such a
-   device fails with a clear error (chapter 04 §6.4, §7 step 9). No WASM
-   module or `wasmtime` is used anywhere.
-6. **Recording identification on the iPod** — no SysInfo "authority"
+3. **Recording identification on the iPod** — no SysInfo "authority"
    file, no background re-validation thread, no caching of live
    SysInfoExtended on the device; identification only reads (chapter 06
    §18). Device icons/colours (`images`) are not part of podsync.
-7. **Everything beyond the file list in §2** — a GUI, an application
+4. **Everything beyond the file list in §2** — a GUI, an application
    layer, podcasts, photos, scrobbling, backups UI, fingerprinting,
    transcode caches, sync review, settings, an updater, `.ithmb` photo
    browsing, iTunes integration over COM, MTP, iPod Touch/iPhone,
    iTunesDB-compatible `iTunesPrefs` writing, `iTunesSD`.
 
+Three items were originally on this list and are now implemented:
+`commit_playcounts_if_needed`/`_commit_playcounts_guarded` (chapter 08 §7.6);
+HASHAB signing for iPod nano 6G/7G (chapter 04 §6.4, via a vendored WASM
+module and the `wasmtime` package); and the SQLite database family iPod nano
+5G-7G use instead of the classic iTunesDB (`podsync.itdb.sqlite`, chapter 04
+§6.5 — write-only, no SQLite reader).
+
 ## 6. Conventions
 
-* **Tests are the acceptance criteria.** Module paths, names, signatures
-  and behavior that tests rely on are mandatory.
+* Module paths, names, signatures and behavior are pinned by the existing
+  test suite (`tests/`); changing them is a breaking change.
 * Exceptions: use the hierarchy in `podsync.itunesdb_parser.exceptions`
   for parse failures; the safety modules define their own precise
   error types (`UnsafeDevicePathError`, `DeviceWriteSafetyError`, …)

@@ -1837,7 +1837,7 @@ order:
 
 ---
 
-## 16. Tests in this room that cover this chapter
+## 16. Tests in this project that cover this chapter
 
 | Test file | What it pins down | Spec section |
 |---|---|---|

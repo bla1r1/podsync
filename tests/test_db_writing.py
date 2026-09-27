@@ -293,3 +293,67 @@ def test_playlist_item_metadata_follows_reassigned_track_ids() -> None:
     strings = collect_strings(user_playlist["mhod_children"])
     assert strings["title"] == "Playlist"
     assert len(user_playlist["mhip_children"]) == 2
+
+
+# ────────────────────────────────────────────────────────────────
+# HASHAB signing (iPod nano 6G/7G)
+# ────────────────────────────────────────────────────────────────
+
+
+class TestHashabSigning:
+    def test_signature_is_deterministic_and_input_sensitive(self) -> None:
+        from podsync.itdb.writer.signing.ab import HASHAB_SIZE, compute_hashab
+
+        baseline = compute_hashab(bytes(20), bytes(8))
+        assert len(baseline) == HASHAB_SIZE
+        assert compute_hashab(bytes(20), bytes(8)) == baseline
+        assert compute_hashab(b"\x01" * 20, bytes(8)) != baseline
+        assert compute_hashab(bytes(20), b"\x02" * 8) != baseline
+
+    def test_write_hashab_sets_scheme_and_preserves_masked_fields(self) -> None:
+        from podsync.itdb.spec.layouts.header import MHBD_OFFSET_DB_ID, MHBD_OFFSET_HASHAB, MHBD_OFFSET_HASHING_SCHEME
+        from podsync.itdb.writer.signing.ab import HASHAB_SIZE, ITDB_CHECKSUM_HASHAB, write_hashab
+
+        image = bytearray(300)
+        image[0:4] = b"mhbd"
+        image[MHBD_OFFSET_DB_ID:MHBD_OFFSET_DB_ID + 8] = b"deadbeef"
+
+        write_hashab(image, bytes(range(8)))
+
+        scheme = int.from_bytes(image[MHBD_OFFSET_HASHING_SCHEME:MHBD_OFFSET_HASHING_SCHEME + 2], "little")
+        assert scheme == ITDB_CHECKSUM_HASHAB
+        assert any(image[MHBD_OFFSET_HASHAB:MHBD_OFFSET_HASHAB + HASHAB_SIZE])
+        assert image[MHBD_OFFSET_DB_ID:MHBD_OFFSET_DB_ID + 8] == b"deadbeef"
+
+    def test_write_hashab_rejects_a_short_firewire_id(self) -> None:
+        from podsync.itdb.writer.signing.ab import write_hashab
+
+        image = bytearray(300)
+        image[0:4] = b"mhbd"
+        with pytest.raises(ValueError, match="FireWire ID"):
+            write_hashab(image, b"\x00\x01")
+
+    def test_hashab_device_signs_through_the_installer(self, tmp_path) -> None:
+        """A device whose capabilities call for HASHAB gets a real signature, not a refusal."""
+        from podsync.hardware.catalog.checksum import SignatureKind
+        from podsync.itdb.writer.database import write_itdb
+
+        from podsync.hardware import make_virtual_ipod
+
+        caps = traits_for_model("iPod Nano", "6th Gen")
+        assert caps is not None and caps.checksum == SignatureKind.HASHAB
+
+        make_virtual_ipod(tmp_path, "MC525")
+        assert write_itdb(
+            str(tmp_path), [], capabilities=caps, firewire_id=bytes(range(8)),
+        ) is True
+
+        # nano 6G/7G capabilities are flagged SQLite-era, so the classic-compatible
+        # companion database the installer signs is the compressed "iTunesCDB".
+        db_bytes = (tmp_path / "iPod_Control" / "iTunes" / "iTunesCDB").read_bytes()
+        from podsync.itdb.spec.layouts.header import MHBD_OFFSET_HASHAB, MHBD_OFFSET_HASHING_SCHEME
+        from podsync.itdb.writer.signing.ab import HASHAB_SIZE, ITDB_CHECKSUM_HASHAB
+
+        scheme = int.from_bytes(db_bytes[MHBD_OFFSET_HASHING_SCHEME:MHBD_OFFSET_HASHING_SCHEME + 2], "little")
+        assert scheme == ITDB_CHECKSUM_HASHAB
+        assert any(db_bytes[MHBD_OFFSET_HASHAB:MHBD_OFFSET_HASHAB + HASHAB_SIZE])

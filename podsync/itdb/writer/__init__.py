@@ -52,7 +52,7 @@ def write_checksum(itdb_data: bytearray, ipod_path: str) -> bool:
     signers = {
         SignatureKind.HASH58: lambda: write_hash58(itdb_data, hardware.get_firewire_id(ipod_path)),
         SignatureKind.HASH72: lambda: write_hash72(itdb_data, ipod_path),
-        SignatureKind.HASHAB: lambda: write_hashab(itdb_data, b""),
+        SignatureKind.HASHAB: lambda: write_hashab(itdb_data, hardware.get_firewire_id(ipod_path)),
     }
     if kind not in signers:
         raise ValueError(f"Unsupported checksum type: {kind}.")

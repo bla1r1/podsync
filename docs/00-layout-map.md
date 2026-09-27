@@ -13,6 +13,7 @@ behaviour is as the chapters describe unless listed under *Additions* below.
 | `podsync.itunesdb_shared` | `podsync.itdb.spec` |
 | `podsync.itunesdb_parser` | `podsync.itdb.reader` |
 | `podsync.itunesdb_writer` | `podsync.itdb.writer` |
+| `podsync.sqlitedb_writer` | `podsync.itdb.sqlite` |
 | `podsync.artworkdb_shared` | `podsync.artwork.spec` |
 | `podsync.artworkdb_parser` | `podsync.artwork.reader` |
 | `podsync.artworkdb_writer` | `podsync.artwork.writer` |

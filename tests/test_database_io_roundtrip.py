@@ -181,10 +181,46 @@ def test_duplicate_key_respects_mount_case_sensitivity() -> None:
 
 
 # ────────────────────────────────────────────────────────────────
-# Trimmed from the reference suite: the separate play-count commit
-# entry points (commit_playcounts_if_needed / _commit_playcounts_guarded)
-# are out of scope for this package — see docs/01-overview.md §5.
+# Standalone play-count commit
 # ────────────────────────────────────────────────────────────────
+
+
+def test_commit_playcounts_rebuilds_and_clears_state_when_deltas_exist(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A Play Counts file with real activity triggers a full rebuild and cleanup."""
+    make_virtual_ipod(tmp_path, "MA005")
+    media_path = tmp_path / "iPod_Control" / "Music" / "F04" / "SPUN.mp3"
+    media_path.parent.mkdir(parents=True, exist_ok=True)
+    media_path.write_bytes(b"audio")
+    track = TrackRecord(title="Spun Up", location=":iPod_Control:Music:F04:SPUN.mp3")
+    assert library_db.save_device_library(tmp_path, [track], raise_on_error=True) is True
+
+    itunes_dir = tmp_path / "iPod_Control" / "iTunes"
+    pc_path = itunes_dir / "Play Counts"
+    pc_path.write_bytes(b"placeholder")  # content unused: read_play_stats is stubbed below
+    monkeypatch.setattr(
+        play_stats, "read_play_stats", lambda _path: [play_stats.PlayStatsEntry(play_count=3)],
+    )
+
+    assert library_db.commit_playcounts_if_needed(tmp_path) is True
+    assert not pc_path.exists()
+    reloaded = library_db.load_device_library(tmp_path)
+    assert [row["title"] for row in reloaded["tracks"]] == ["Spun Up"]
+
+
+def test_commit_playcounts_is_a_noop_without_activity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """No Play Counts file, or one with nothing but zeros, commits nothing."""
+    make_virtual_ipod(tmp_path, "MA477")
+
+    assert library_db.commit_playcounts_if_needed(tmp_path) is False
+
+    monkeypatch.setattr(play_stats, "read_play_stats", lambda _path: [play_stats.PlayStatsEntry()])
+    assert library_db.commit_playcounts_if_needed(tmp_path) is False
 
 
 # ────────────────────────────────────────────────────────────────

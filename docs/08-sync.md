@@ -22,7 +22,7 @@ not restate their internals except where the mapping performed by
 | Module path | Role | Public names (must exist) |
 |---|---|---|
 | `podsync.sync` | package marker, docstring only | *(nothing)* |
-| `podsync.sync._db_io` | database read/write/verify/cleanup | `DatabaseVerificationError`, `read_existing_database`, `verify_written_database`, `write_database`, `delete_playcounts_files`, private `_database_media_path_key` |
+| `podsync.sync._db_io` | database read/write/verify/cleanup | `DatabaseVerificationError`, `read_existing_database`, `verify_written_database`, `write_database`, `delete_playcounts_files`, `commit_playcounts_if_needed`, private `_database_media_path_key`, `_commit_playcounts_guarded` |
 | `podsync.sync._track_conversion` | parsed dict ⇄ `TrackInfo` mapping, eval-dict projection | `ipod_filetype_for_extension`, `track_dict_to_info`, `trackinfo_to_eval_dict` |
 | `podsync.sync._playlist_builder` | dataset 2/3/5 playlist construction + SPL evaluation hook | `build_and_evaluate_playlists`, `sort_tracks_by_order`, `sort_trackinfos_by_order`, `decode_raw_blob` |
 | `podsync.sync.spl_evaluator` | smart-playlist rule engine | `spl_update`, `spl_update_all`, `spl_update_from_parsed`, `eval_rule` |
@@ -66,15 +66,16 @@ No module in `podsync.sync` may import `podsync.gui`,
 `podsync.application`, `podsync.sync.transcoder`,
 `podsync.sync.quick_writes`, `podsync.sync.mapping`,
 `podsync.sync.contracts`, `podsync.sync.pc_library`,
-`podsync.sqlitedb_writer`, or any application-layer package (§9).
+or any application-layer package (§9). (`podsync.itdb.sqlite` — the SQLite
+database writer, §7.3.3 — is a real module; it is `podsync.sqlitedb_writer`
+under its original spec name, not one of the excluded ones above.)
 
 ### 1.3 Scope exclusions (explicit)
 
 | Excluded item | Required behavior in podsync |
 |---|---|
-| SQLite write path for nano 5G–7G (`write_sqlite_databases`, `iTunes Library.itlp` population, `db_pid` extraction for SQLite, `get_firewire_id` for cbk) | Absent from `write_database`. `podsync.sqlitedb_writer` does not exist (importing it fails). `write_database` **refuses** SQLite-requiring devices with a clear error — see §7.3.3. |
 | `pc_track_to_info` (PC-library track → `TrackInfo`) | Absent from `_track_conversion`. The name must not exist (`AttributeError` on `podsync.sync._track_conversion.pc_track_to_info`); no PC-library/transcoder imports. |
-| `commit_playcounts_if_needed` and `_commit_playcounts_guarded` | Absent from `_db_io`. Play-count *merging during a read* stays in scope (§7.2.6); committing play counts as a separate step does not exist. |
+| ~~`commit_playcounts_if_needed` and `_commit_playcounts_guarded`~~ | **Implemented** as `podsync.library.database.commit_playcounts_if_needed` (with a private `_commit_playcounts_guarded` helper) — see §7.6. Play-count *merging during a read* (§7.2.6) is what it rebuilds from; it is not a separate accounting path. |
 | `sync.quick_writes`, `sync.mapping`, `sync.contracts`, `sync.transcoder`, `sync.pc_library` | Modules do not exist; any reference raises a clear `ImportError`/`ModuleNotFoundError`. (Reference tests that exercise `write_cached_itunesdb` etc. are out of scope; only their `build_and_evaluate_playlists` / `track_dict_to_info` cases apply.) |
 | GUI / application / podcasts / scrobbling layers | Not present anywhere in `podsync.sync`. |
 
@@ -1414,25 +1415,21 @@ defaults).
   exception unchanged; else return `False`.
 * If it returns falsy → return `False` (no verification).
 
-**7.3.3 SQLite refusal (unsupported devices).** Before calling
-`write_itunesdb`, evaluate:
+**7.3.3 SQLite routing (nano 5G-7G).** Before calling `write_itunesdb`, evaluate:
 
 ```
 sqlite_required = (capabilities is not None and capabilities.uses_sqlite_db)
                   or os.path.isdir(<ipod_path>/iPod_Control/iTunes/iTunes Library.itlp)
 ```
 
-If `sqlite_required` → **raise `NotImplementedError`** with a message
-that clearly names SQLite as unsupported (must contain the words
-`SQLite` and `not supported`), e.g.
-`"SQLite databases (iPod nano 5G-7G) are not supported: write_database only writes the classic iTunesDB family"`.
-This raise happens **before any device mutation** (fail fast — nothing
-is written) and is **not** governed by `raise_on_error`: it is a static
-unsupported-device refusal, not a runtime failure. The whole SQLite
-phase of a full implementation (writing to `iTunes Library.itlp`,
-`db_pid` extraction from the header, `get_firewire_id` for cbk signing,
-`write_sqlite_databases`) must not exist in podsync;
-`podsync.sqlitedb_writer` is an absent module.
+If `sqlite_required`, `write_database` calls
+`podsync.itdb.sqlite.write_sqlite_databases` instead of `write_itunesdb`
+(chapter 04 §6.5) — resolving `checksum_kind` from `capabilities.checksum`
+and, for HASH58/HASHAB, a `firewire_id` via `hardware.get_firewire_id`
+(a missing FireWire ID here follows the same log-and-return-`False`/
+`raise_on_error` rule as any other write failure, not a static refusal).
+Since there is no SQLite reader, this path returns right after the write —
+§7.3.4's read-back verification only applies to the classic path.
 
 **7.3.4 Read-back verification (after a successful serialization).**
 Call the module-global `verify_written_database(ipod_path,
@@ -1445,7 +1442,7 @@ verification passed. Summary of outcomes:
 
 | condition | result |
 |---|---|
-| SQLite-required device | raise `NotImplementedError` (always) |
+| SQLite-required device | routes to `write_sqlite_databases` (§7.3.3); no read-back verification |
 | writer raised, `raise_on_error=False` | `False` |
 | writer raised, `raise_on_error=True` | original exception |
 | writer returned falsy | `False` |
@@ -1566,7 +1563,42 @@ Exceptions raised *by the hook itself* that are not `OSError`/
 `UnsafeDevicePathError` (e.g. a `DeviceWriteSafetyError` from
 revalidation) propagate unchanged.
 
-### 7.6 Side-effect ledger
+### 7.6 `commit_playcounts_if_needed`
+
+```python
+def commit_playcounts_if_needed(ipod_path: Path) -> bool
+```
+
+Merges the firmware's `Play Counts` into the database immediately,
+instead of waiting for the next full sync to pick it up during a read.
+`False`, with the device untouched, when: `podsync.itdb.reader.play_stats
+.read_play_stats` returns `None`/empty for `iTunes/Play Counts`, or every
+entry's `has_data` is `False` (nothing played or skipped, no on-device
+rating change); or (inside the guarded commit) the reloaded database has
+no tracks to rebuild.
+
+Otherwise: acquire a `WriteLock` (chapter 07) keyed by
+`lock_key_for(check_write_ready(ipod_path))`, then, holding it,
+`_commit_playcounts_guarded`:
+
+1. `read_existing_database`-equivalent (`load_device_library`) — this is
+   where the Play Counts deltas actually get folded into the track rows
+   (§7.2.6); nothing here re-parses them a second time.
+2. Convert every row to a `TrackRecord` and rebuild the full playlist set
+   (`assemble_playlists`, chapter 03/04) from the reloaded rows, exactly
+   as a caller doing a full sync commit would.
+3. `write_database`-equivalent (`save_device_library`), with
+   `before_database_replace=guard.assert_database_unchanged` and
+   `before_device_mutation` revalidating write-readiness — same hooks
+   §7.3 describes.
+4. On success, `delete_playcounts_files`-equivalent
+   (`clear_device_play_state`), revalidating before each file.
+
+Returns `True` only once all of the above succeeded; a failed write
+follows `save_device_library`'s own success/failure and exception rules
+(§7.3) and this function returns `False` without attempting cleanup.
+
+### 7.7 Side-effect ledger
 
 | order | operation | files | mode |
 |---|---|---|---|
@@ -1581,7 +1613,7 @@ revalidation) propagate unchanged.
 Media files under `iPod_Control/Music` are **never created or deleted
 by this package** — only referenced and checked.
 
-### 7.7 Expected differences after a read → write cycle
+### 7.8 Expected differences after a read → write cycle
 
 Measured on an iTunes-written database from an iPod Video 5.5G (1 316
 tracks): a full `read_existing_database` → `track_dict_to_info` →
@@ -1641,17 +1673,18 @@ listed in §1.3.
 
 ## 9. Exclusions recap (normative)
 
-1. **No SQLite path.** `write_database` refuses SQLite-requiring devices
-   with `NotImplementedError` (§7.3.3) before any mutation;
-   `podsync.sqlitedb_writer`, `db_pid`-for-SQLite extraction, and
-   `get_firewire_id` usage are absent.
+1. **The SQLite path (`podsync.itdb.sqlite`) is implemented** (§7.3.3,
+   chapter 04 §6.5) — `write_database` routes SQLite-required devices there
+   instead of refusing them. It has no reader; nothing in podsync can read
+   an `iTunes Library.itlp` back.
 2. **No `pc_track_to_info`** in `podsync.sync._track_conversion`; no
    `podsync.sync.pc_library`, `podsync.sync.transcoder`.
-3. **No `commit_playcounts_if_needed` / `_commit_playcounts_guarded`**
-   in `podsync.sync._db_io`; no `podsync.sync.database_commit`. Play
-   counts are *merged during reads* (§7.2.6) and *cleared* after commits
-   by a caller invoking `delete_playcounts_files` — that is the entire
-   play-count handling surface.
+3. **`commit_playcounts_if_needed` / `_commit_playcounts_guarded`** live
+   in `podsync.library.database` (§7.6) — a standalone commit outside a
+   full sync still merges during a read (§7.2.6), rebuilds, writes and
+   clears state on its own. No separate `podsync.sync.database_commit`
+   module exists; the helper is small enough to sit directly in
+   `database.py` alongside `load_device_library`/`save_device_library`.
 4. **No `podsync.sync.quick_writes` / `mapping` / `contracts`**, no
    `gui` / `application` / `podcasts` imports; referencing them raises a
    clear import error.

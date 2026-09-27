@@ -27,6 +27,7 @@ from podsync.itdb.writer.track import TrackRecord
 __all__ = [
     "ReadbackError",
     "clear_device_play_state",
+    "commit_playcounts_if_needed",
     "load_device_library",
     "save_device_library",
     "verify_saved_library",
@@ -215,6 +216,42 @@ def _needs_sqlite(ipod_path: Path, traits) -> bool:
     return os.path.isdir(os.path.join(str(ipod_path), "iPod_Control", "iTunes", "iTunes Library.itlp"))
 
 
+def _save_sqlite_library(
+    ipod_path: Path, tracks: list[TrackRecord], *, playlists: list[PlaylistRecord],
+    smart_playlists: list[PlaylistRecord] | None, master_playlist_name: str, traits, raise_on_error: bool,
+    before_database_replace: Callable[[], None] | None, before_device_mutation: Callable[[], None] | None,
+) -> bool:
+    import podsync.hardware as hardware
+    from podsync.hardware.catalog.checksum import SignatureKind
+    from podsync.itdb.sqlite import write_sqlite_databases
+
+    checksum_kind = SignatureKind(traits.checksum) if traits is not None else SignatureKind.NONE
+    firewire_id = None
+    if checksum_kind in (SignatureKind.HASH58, SignatureKind.HASHAB):
+        try:
+            firewire_id = hardware.get_firewire_id(str(ipod_path))
+        except RuntimeError as exc:
+            logger.error("No FireWire ID is available to sign the SQLite databases: %s", exc)
+            if raise_on_error:
+                raise
+            return False
+
+    try:
+        written = write_sqlite_databases(
+            str(ipod_path), tracks, playlists=playlists, smart_playlists=smart_playlists,
+            master_playlist_name=master_playlist_name, checksum_kind=checksum_kind, firewire_id=firewire_id,
+            before_database_replace=before_database_replace, before_device_mutation=before_device_mutation,
+        )
+    except Exception as exc:
+        logger.exception("SQLite database write failed; output was not committed. %s", exc)
+        if raise_on_error:
+            raise
+        return False
+    if not written:
+        logger.warning("The SQLite database writer reported failure; nothing to verify")
+    return written
+
+
 def save_device_library(
     ipod_path: Path,
     tracks: list[TrackRecord],
@@ -234,16 +271,19 @@ def save_device_library(
 ) -> bool:
     """Write the library, then prove it reads back.  ``True`` only when both succeed.
 
-    SQLite-era devices (nano 5G–7G) are refused up front with
-    ``NotImplementedError`` regardless of *raise_on_error*: nothing is written.
+    SQLite-era devices (nano 5G-7G) get ``iTunes Library.itlp`` instead of a
+    classic ``iTunesDB``; there is no SQLite reader, so that path returns
+    right after a successful write without the read-back verification below.
     """
     import podsync.itdb.writer as writer
 
     traits = _device_traits(ipod_path)
     if _needs_sqlite(ipod_path, traits):
-        raise NotImplementedError(
-            "SQLite databases (iPod nano 5G-7G) are not supported: "
-            "save_device_library only writes the classic iTunesDB family"
+        return _save_sqlite_library(
+            ipod_path, tracks, playlists=[*(playlists or []), *(podcast_playlists or [])],
+            smart_playlists=smart_playlists, master_playlist_name=master_playlist_name,
+            traits=traits, raise_on_error=raise_on_error,
+            before_database_replace=before_database_replace, before_device_mutation=before_device_mutation,
         )
 
     logger.info("Writing %d tracks to %s", len(tracks), ipod_path)
@@ -381,3 +421,76 @@ def clear_device_play_state(
                 f"could not be cleared ({name}): {exc}"
             ) from exc
         logger.info("Cleared device-generated sync state %s", target)
+
+
+# ── standalone play-count commit ───────────────────────────────────────
+
+
+def commit_playcounts_if_needed(ipod_path: Path) -> bool:
+    """Merge the firmware's ``Play Counts`` into the database right now, if there is any.
+
+    Rebuilds every track and playlist the same way a full sync would (load,
+    which already merges play deltas into the track rows; convert; reassemble
+    playlists) and rewrites the database, then clears the play-state files.
+    Holds a :class:`~podsync.hardware.safety.guard.WriteLock` for the whole
+    operation so nothing else touches the device meanwhile. ``False`` when
+    there is nothing to commit, there are no tracks to rebuild, or the write
+    itself fails; the device is left untouched in every ``False`` case except
+    a failed write, which follows :func:`save_device_library`'s own rules.
+    """
+    import podsync.itdb.reader.play_stats as play_stats
+    from podsync.hardware.safety.guard import WriteLock
+    from podsync.hardware.safety.readiness import check_write_ready, lock_key_for
+
+    ipod_path = Path(ipod_path)
+    pc_path = ipod_path / _ITUNES_DIR / "Play Counts"
+    entries = play_stats.read_play_stats(pc_path)
+    if not entries or not any(entry.has_data for entry in entries):
+        return False
+
+    profile = check_write_ready(ipod_path)
+    with WriteLock(ipod_path, volume_key=lock_key_for(profile)) as guard:
+        return _commit_playcounts_guarded(ipod_path, profile, guard)
+
+
+def _commit_playcounts_guarded(ipod_path: Path, profile, guard) -> bool:
+    from podsync.hardware.safety.readiness import recheck_write_ready
+    from podsync.library.playlists import assemble_playlists
+    from podsync.library.tracks import record_from_row
+
+    parsed = load_device_library(ipod_path)
+    tracks_data = parsed.get("tracks") or []
+    if not tracks_data:
+        return False
+
+    all_tracks = [record_from_row(row) for row in tracks_data]
+    (
+        master_name, master_id, playlists,
+        podcast_master_name, podcast_master_id, podcast_playlists,
+        smart_playlists,
+    ) = assemble_playlists(
+        tracks_data,
+        parsed.get("dataset2_standard_playlists", []),
+        parsed.get("dataset3_podcast_playlists", []),
+        parsed.get("dataset5_smart_playlists", []),
+        all_tracks,
+        time_context=parsed.get("device_time_context"),
+    )
+
+    def _revalidate() -> None:
+        nonlocal profile
+        profile = recheck_write_ready(profile)
+
+    committed = save_device_library(
+        ipod_path, all_tracks,
+        playlists=playlists, podcast_playlists=podcast_playlists, smart_playlists=smart_playlists,
+        master_playlist_name=master_name, master_playlist_id=master_id,
+        podcast_master_playlist_name=podcast_master_name, podcast_master_playlist_id=podcast_master_id,
+        before_database_replace=guard.assert_database_unchanged,
+        before_device_mutation=_revalidate,
+    )
+    if not committed:
+        return False
+
+    clear_device_play_state(ipod_path, before_device_mutation=_revalidate)
+    return True

@@ -38,8 +38,8 @@ podsync/itunesdb_writer/
 ├── mhip_writer.py       playlist items (MHIP) + position MHOD 100
 ├── hash58.py            HMAC-SHA1 signature at mhbd+0x58 (Classic/Nano 3G–4G)
 ├── hash72.py            AES signature at mhbd+0x72 (Nano 5G) + HashInfo file
-└── hashab.py            signature at mhbd+0xAB (Nano 6G/7G) — unsupported,
-                         raises (§6.4)
+└── hashab.py            white-box AES signature at mhbd+0xAB (Nano 6G/7G),
+                         via a vendored WASM module + wasmtime (§6.4)
 ```
 
 The writer imports these shared packages (all part of the reimplementation):
@@ -89,7 +89,7 @@ def write_checksum(itdb_data: bytearray, ipod_path: str) -> bool
 | `ChecksumType.NONE` | return `True` (no bytes changed) |
 | `ChecksumType.HASH58` | `write_hash58(itdb_data, get_firewire_id(ipod_path))`; `True` |
 | `ChecksumType.HASH72` | `write_hash72(itdb_data, ipod_path)`; `True` |
-| `ChecksumType.HASHAB` | `write_hashab(...)`, which raises `NotImplementedError` (§6.4) |
+| `ChecksumType.HASHAB` | `write_hashab(itdb_data, get_firewire_id(ipod_path))`; `True` (§6.4) |
 | anything else | `raise ValueError(f"Unsupported checksum type: {checksum_type}.")` |
 
 Side effect: mutates `itdb_data` in place; never touches the filesystem
@@ -1462,18 +1462,84 @@ when no material is available.
 (`ValueError("Invalid iTunesDB: expected 'mhbd' header")`); **set `hashing_scheme` = 2 first** (it is part of the SHA1 input);
 then store the 46-byte signature at 0x72.
 
-### 6.4 `hashab` — unsupported (Nano 6G/7G)
+### 6.4 `hashab` (Nano 6G/7G)
 
 Nano 6G/7G databases carry a 57-byte signature at MHBD +0xAB computed with a
-white-box AES implementation. podsync does **not** implement it (chapter 01
-§5). The module exists only so imports and the package `__all__` stay
-stable:
+white-box AES implementation. No public specification of the algorithm
+exists, so podsync runs the same clean-room WebAssembly reimplementation the
+wider community relies on (`dstaley/hashab`, vendored unmodified at
+`podsync/itdb/writer/signing/wasm/calcHashAB.wasm`, The Unlicense — see
+`THIRD_PARTY_NOTICE.md` next to it) through the `wasmtime` package.
 
 - `HASHAB_SIZE = 57`, `ITDB_CHECKSUM_HASHAB = 4` (the MHBD wire value).
-- `compute_hashab(sha1_digest, uuid)` and `write_hashab(itdb_data, firewire_id)`
-  raise `NotImplementedError("HASHAB signing (iPod nano 6G/7G) is not supported by podsync")`
-  without touching `itdb_data`.
-- No WASM module, no `wasmtime` import, no network download.
+- `compute_hashab(sha1_digest, uuid) -> bytes`: `sha1_digest` is a 20-byte
+  digest, `uuid` an 8+ byte FireWire GUID; writes both into the WASM
+  module's linear memory, calls its `calculateHash` export, and reads back
+  the 57-byte result. Deterministic for a given input pair.
+- `write_hashab(itdb_data, firewire_id) -> None`: validates `len(itdb_data)
+  ≥ 0xAB + 57` and the `mhbd` magic; zeroes `db_id` (0x18), the 20 bytes at
+  0x32, `hash58` (0x58), `hash72` (0x72) and `hashab` (0xAB) itself before
+  taking the SHA-1 (mirroring HASH58's masking, since HASHAB devices keep a
+  HASH58-shaped header too); sets `hashing_scheme` = 4; computes and stores
+  the signature at 0xAB; restores `db_id` and the 0x32 bytes (matching
+  HASH58/HASH72's own restore step).
+- The `_DatabaseInstall.sign` path (chapter 04 §7 step 9) calls this the
+  same way it calls HASH58/HASH72, using `firewire_id` if the caller passed
+  one, else `hardware.get_firewire_id(ipod_path)`; missing wasmtime or a
+  missing FireWire ID surface as the same kind of clear error string the
+  other schemes use, not a crash.
+
+### 6.5 `podsync.itdb.sqlite` — the SQLite family (Nano 5G-7G)
+
+Nano 5G-7G devices keep their library in `iPod_Control/iTunes/iTunes
+Library.itlp/`, five SQLite databases plus a signed checksum book, instead
+of a single binary iTunesDB. This is write-only: there is no SQLite reader
+anywhere in podsync, so a caller cannot read these back the way
+`podsync.library.database.load_device_library` reads the classic format.
+
+- `library.write_library_itdb(path, tracks, *, playlists=None,
+  smart_playlists=None, master_playlist_name="iPod", db_pid=0) -> list[int]`:
+  writes `Library.itdb` — `item` (tracks), `album`/`artist`/`track_artist`/
+  `composer` (stable pids, first-seen order), `genre_map`/`category_map`,
+  `avformat_info`, `podcast_info`, `container`/`item_to_container`
+  (playlists; the master playlist holds every track). Sort-order ranks
+  (`title_order`, `artist_order`, …) are `(alphabetical position + 1) * 100`
+  per field, matching real iTunes-written databases; an unset field ranks
+  100. Returns every playlist's pid, master first.
+- `locations.write_locations_itdb(path, tracks)`: `Locations.itdb` — one
+  `location` row per track (path relative to `iPod_Control/Music`) plus a
+  single `base_location` row.
+- `dynamic.write_dynamic_itdb(path, tracks, playlist_ids)`: `Dynamic.itdb`
+  — `item_stats` (play/skip counts, rating, bookmark) per track,
+  `container_ui` per playlist pid.
+- `extras.write_extras_itdb(path, tracks)`: `Extras.itdb` — `lyrics` and
+  `chapter` rows for tracks that have them (chapters reuse
+  `podsync.itdb.writer.strings.build_chapter_blob`, the same MHOD 17 body
+  format the binary iTunesDB uses).
+- `genius.write_genius_itdb(path)`: `Genius.itdb` with its real (always
+  empty here) tables — podsync computes no Genius data.
+- `cbk.write_locations_cbk(cbk_path, locations_itdb_path, *, checksum_kind,
+  firewire_id, ipod_path)`: `Locations.itdb.cbk` — SHA-1 every 1024-byte
+  block of `Locations.itdb`, SHA-1 the concatenation of those digests, then
+  sign *that* digest with whatever scheme the device needs
+  (`compute_hashab`/`compute_hash58`/`hash72_signature` — the same
+  primitives §6.2-§6.4 use, since all three sign a digest directly).
+  `SignatureKind.NONE` writes the bare digest as the header, unsigned.
+- `write_sqlite_databases(ipod_path, tracks, *, playlists=None,
+  smart_playlists=None, master_playlist_name="iPod", db_pid=None,
+  checksum_kind=SignatureKind.NONE, firewire_id=None, backup=True,
+  before_database_replace=None, before_device_mutation=None) -> bool`: the
+  orchestrator. Builds all five databases (and the cbk, when
+  `checksum_kind != NONE`) in a temp directory first; only if every one of
+  them succeeds does it back up any existing files (when `backup=True`) and
+  install the new ones, one at a time, via the same durable
+  temp-file-then-atomic-replace primitives chapter 07 uses elsewhere. Any
+  failure while building leaves the device untouched and returns `False`.
+- `podsync.library.database.save_device_library` calls this instead of
+  `write_itdb` when the device's capabilities say `uses_sqlite_db` (or an
+  `iTunes Library.itlp` already exists) — see chapter 08. Since there is no
+  SQLite reader, that path returns right after a successful write, skipping
+  the read-back verification the classic path performs.
 
 ---
 
@@ -1605,8 +1671,8 @@ pending artwork; the two noted return `False` instead):
      inline); pack `hashing_scheme = 2` **before** computing (it is part of
      the SHA1 input); nothing worked → `hash_error` = `"No valid HashInfo material is available to compute the required HASH72 signature. podsync stopped before writing a database the iPod firmware would reject."`.
      No hash58 is written in this branch.
-   - **HASHAB branch**: `hash_error = "HASHAB signing (iPod nano 6G/7G) is not supported by podsync"`
-     — no signing is attempted.
+   - **HASHAB branch**: `write_hashab` with `firewire_id` (argument, else
+     `get_firewire_id(ipod_path)`); missing → `hash_error` = `"No FireWire ID is available to compute the required HASHAB signature. podsync stopped before writing a database the iPod firmware would reject."`; `wasmtime` not installed → `hash_error` = that `ImportError`'s message (§6.4).
    - **UNSUPPORTED** → `hash_error = "Device requires an unsupported hashing scheme"`.
    - **UNKNOWN** → `hash_error = "Cannot write iTunesDB: device checksum type is UNKNOWN. The device was not fully identified — the iPod will reject this database. Please report this as a bug."`
    - **NONE** → pack `hashing_scheme = 0`.
@@ -1673,12 +1739,13 @@ files inside the same directory.
 | Chapters invalid / > 500 / suspicious titles | chapter MHOD skipped (whole list) |
 | Playlist references unknown `db_track_id` | silently dropped during remap |
 | `item_metadata` length mismatch after remap | metadata dropped (`None`) |
-| `write_itunesdb` hash material missing (HASH58/72) or HASHAB device | returns `False`, artwork aborted, device untouched |
+| `write_itunesdb` hash material missing (HASH58/72/AB) | returns `False`, artwork aborted, device untouched |
 | `write_itunesdb` preflight/IO failure | artwork aborted, exception raised (preflight) or `False` (backup/write) |
 | Checksum unsupported/unknown | `hash_error` → `False` |
 | `write_checksum` unsupported enum | `ValueError(f"Unsupported checksum type: {checksum_type}.")` |
 | `compute_hash72` without HashInfo | `FileNotFoundError` |
-| `compute_hashab` / `write_hashab` called directly | `NotImplementedError` |
+| `compute_hashab` with a wrong-sized `sha1_digest`/`uuid` | `ValueError` |
+| `write_hashab` on an undersized/non-`mhbd` buffer, or a short `firewire_id` | `ValueError` |
 
 Ordering guarantees:
 
@@ -1711,12 +1778,10 @@ work on copies).
 - SQLite nano 5G–7G write path — **absent** from this package; callers must
   get a clear error elsewhere, not a silent fallback to binary iTunesDB.
 - `pc_track_to_info` (track conversion from PC metadata).
-- `commit_playcounts_if_needed` (play-counts DB flush).
 - Anything importing gui / application / podcasts / `sync.transcoder` /
   `sqlitedb_writer`.
 - Artwork writing internals — only the deferred commit/abort contract of
   `write_artworkdb`/`PendingArtworkWrite` as used in §7 step 6.
-- HASHAB signing (§6.4).
 - Provenance: the `hash58`/`hash72` constants are public format facts
   (TABLE1/TABLE2 are the standard AES S-box and its inverse, FIPS-197);
   no provenance names appear in the public API or messages.
@@ -1727,5 +1792,5 @@ work on copies).
 
 Chapter 01 and this chapter agree: the generic header is the 12-byte
 `"<4sII"` record of §2.1; HASH58 = iPod Classic + Nano 3G/4G, HASH72 =
-Nano 5G, HASHAB (Nano 6G/7G) is refused (§6.4); pre-2007 models (including
+Nano 5G, HASHAB = Nano 6G/7G (§6.4); pre-2007 models (including
 the iPod Video 5G/5.5G) need no hash.

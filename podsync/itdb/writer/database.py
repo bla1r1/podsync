@@ -52,6 +52,7 @@ from podsync.itdb.writer.signing.aes72 import (
     extract_hash_info_to_dict,
     read_hash_info,
 )
+from podsync.itdb.writer.signing.ab import write_hashab
 from podsync.itdb.writer.signing.hmac58 import write_hash58
 from podsync.itdb.writer.track import TrackRecord, generate_db_track_id
 
@@ -725,6 +726,24 @@ class _DatabaseInstall:
         )
         return ""
 
+    def _sign_hashab(self, image: bytearray) -> str:
+        firewire = self.o["firewire_id"]
+        if not firewire:
+            try:
+                firewire = self.hardware.get_firewire_id(self.ipod_path)
+            except RuntimeError:
+                firewire = None
+        if not firewire:
+            return (
+                "No FireWire ID is available to compute the required HASHAB signature. "
+                "podsync stopped before writing a database the iPod firmware would reject."
+            )
+        try:
+            write_hashab(image, firewire)
+        except ImportError as exc:
+            return str(exc)
+        return ""
+
     def sign(self, image: bytearray) -> str:
         """Sign *image* in place; returns an error message when signing is impossible."""
         self.progress("Signing database")
@@ -733,8 +752,9 @@ class _DatabaseInstall:
             return self._sign_hash58(image)
         if kind == SignatureKind.HASH72:
             return self._sign_hash72(image)
+        if kind == SignatureKind.HASHAB:
+            return self._sign_hashab(image)
         refusals = {
-            SignatureKind.HASHAB: "HASHAB signing (iPod nano 6G/7G) is not supported by podsync",
             SignatureKind.UNSUPPORTED: "Device requires an unsupported hashing scheme",
             SignatureKind.UNKNOWN: (
                 "Cannot write iTunesDB: device checksum type is UNKNOWN. The device was not fully identified "
