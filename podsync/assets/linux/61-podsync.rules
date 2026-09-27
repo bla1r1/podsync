@@ -1,0 +1,21 @@
+# podsync: publish the Apple product serial of a connected iPod.
+#
+# The kernel's USB serial for an iPod is its FireWire GUID; the Apple product
+# serial (used to identify the exact model) lives on SCSI VPD page 0x80.  These
+# rules read that page with udev's own scsi_id helper and publish it as
+# ID_PODSYNC_PRODUCT_SERIAL.  They change no permissions and leave the
+# standard ID_SERIAL values untouched.
+
+# 1. Clear stale values on every disk so a previous result never survives.
+ACTION=="add|change", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", ENV{ID_PODSYNC_RULE_VERSION}="", ENV{ID_PODSYNC_PRODUCT_SERIAL}=""
+
+# 2. Mark the rule version before probing, so a failed probe is distinguishable
+#    from a rule that never ran.
+ACTION=="add|change", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", ATTRS{vendor}=="Apple*", ATTRS{model}=="iPod*", ENV{ID_PODSYNC_RULE_VERSION}="2"
+
+# 3. Read VPD page 0x80 (the legacy --whitelisted spelling keeps old udev/eudev
+#    working); the third field of the result is the product serial.
+ACTION=="add|change", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", ATTRS{vendor}=="Apple*", ATTRS{model}=="iPod*", PROGRAM="scsi_id --page=0x80 --whitelisted --device=/dev/%k", RESULT=="SApple*iPod*", ENV{ID_PODSYNC_PRODUCT_SERIAL}="%c{3}"
+
+# 4. Only with a published serial, add a stable by-id link.
+ACTION=="add|change", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", ENV{ID_PODSYNC_PRODUCT_SERIAL}=="?*", OPTIONS+="string_escape=replace", SYMLINK+="disk/by-id/ipod-$env{ID_PODSYNC_PRODUCT_SERIAL}"

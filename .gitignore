@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# local verification harnesses, not part of the shipped package
+verify_shared.py
+verify_parser.py
+verify_forensics.py
+verify_writer.py
+verify_device.py
+verify_safety.py
+verify_models.py
+verify_sysinfo.py
+run_tests.py
+why.py
+
+.venv/
+ipod_backup/

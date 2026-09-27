@@ -1,0 +1,5 @@
+# Room dependencies — nothing outside this list may be used by podsync.
+pytest>=8.0
+pycryptodome>=3.20
+pillow>=10.0
+pyusb>=1.2
