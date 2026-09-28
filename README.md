@@ -51,4 +51,4 @@ python -m pytest
 
 ## License
 
-GPL-2.0-or-later — see `COPYRIGHT`.
+GPL-3.0-only — see `COPYRIGHT`.
