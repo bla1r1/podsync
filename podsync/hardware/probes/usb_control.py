@@ -81,9 +81,27 @@ def _choose(candidates: list, usb_pid: int, serial_filter: str):
     return match
 
 
+def _dispose(devices: list) -> None:
+    """Close the handles PyUSB opened on first use: a handle left open keeps the iPod busy
+    for the next process that needs it (the identification run as root)."""
+    _core, util = _usb_modules()
+    for device in devices:
+        try:
+            util.dispose_resources(device)
+        except Exception:
+            pass
+
+
 def query_ipod_usb_sysinfo_extended(usb_pid: int = 0, serial_filter: str = "") -> dict[str, Any] | None:
     """Parsed plist keys plus ``usb_pid``, ``usb_serial``, ``vpd_raw_xml`` and transport markers."""
     candidates = _find_devices(usb_pid)
+    try:
+        return _query(candidates, usb_pid, serial_filter)
+    finally:
+        _dispose(candidates)
+
+
+def _query(candidates: list, usb_pid: int, serial_filter: str) -> dict[str, Any] | None:
     chosen = _choose(candidates, usb_pid, serial_filter) if candidates else None
     if chosen is None:
         return None

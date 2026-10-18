@@ -16,6 +16,7 @@ prints what every connected iPod reports and can write SysInfo files.
 from __future__ import annotations
 
 import argparse
+import errno
 import importlib
 import logging
 import os
@@ -42,6 +43,12 @@ _CSW_LENGTH = 13
 _REMOUNT_WAIT_S = 12
 _PAUSE_BETWEEN_DEVICES_S = 3
 
+# Whether a scan (find_ipods, identify_mounted_ipod) asks the device itself when nothing on
+# disk names the model. On macOS that query takes the disk from the system, so the iPod
+# drops off and comes back on every scan; an app that scans often can turn it off and
+# call identify_by_vpd only when asked to.
+AUTO_PROBE = True
+
 
 def _is_root() -> bool:
     geteuid = getattr(os, "geteuid", None)
@@ -67,14 +74,50 @@ def _device_serial(usb, device) -> str:
         return ""
 
 
-def _bulk_inquiry(ep_out, ep_in, tag: int, evpd: bool, page: int, length: int) -> bytes | None:
-    """One INQUIRY wrapped in a command block wrapper; ``None`` when the status byte is not 0."""
+def _stalled(exc: Exception) -> bool:
+    return getattr(exc, "errno", None) == errno.EPIPE
+
+
+def _reset_recovery(device, ep_out, ep_in) -> None:
+    """Bulk-Only reset recovery (the USB mass-storage spec, 5.3.4): after a timeout the
+    device and the host disagree on where they are, and every later command times out too."""
+    for step in (lambda: device.ctrl_transfer(0x21, 0xFF, 0, 0, None, timeout=_BULK_TIMEOUT_MS),
+                 lambda: ep_in.clear_halt(), lambda: ep_out.clear_halt()):
+        try:
+            step()
+        except Exception as exc:
+            logger.debug("Bulk-only reset recovery step failed: %s", exc)
+
+
+def _bulk_inquiry(device, ep_out, ep_in, tag: int, evpd: bool, page: int, length: int) -> bytes | None:
+    """One INQUIRY wrapped in a command block wrapper; ``None`` when the status byte is not 0.
+
+    A STALL on the data stage is the device's normal way to refuse a page or to end a short
+    reply: the halt is cleared and the status still read (the spec's order). Without that the
+    status stays queued and every following command times out, five seconds each.
+    """
     cdb = inquiry_cdb(evpd, page, length & 0xFF)
     cbw = struct.pack("<4sIIBBB", b"USBC", tag, length, 0x80, 0, len(cdb)) + cdb.ljust(16, b"\x00")
-    ep_out.write(cbw, timeout=_BULK_TIMEOUT_MS)
-    data = bytes(ep_in.read(length, timeout=_BULK_TIMEOUT_MS))
-    status = bytes(ep_in.read(_CSW_LENGTH, timeout=_BULK_TIMEOUT_MS))
-    return data if len(status) >= _CSW_LENGTH and status[12] == 0 else None
+    try:
+        ep_out.write(cbw, timeout=_BULK_TIMEOUT_MS)
+        try:
+            data = bytes(ep_in.read(length, timeout=_BULK_TIMEOUT_MS))
+        except Exception as exc:
+            if not _stalled(exc):
+                raise
+            ep_in.clear_halt()
+            data = b""
+        try:
+            status = bytes(ep_in.read(_CSW_LENGTH, timeout=_BULK_TIMEOUT_MS))
+        except Exception as exc:
+            if not _stalled(exc):
+                raise
+            ep_in.clear_halt()
+            status = bytes(ep_in.read(_CSW_LENGTH, timeout=_BULK_TIMEOUT_MS))
+    except Exception:
+        _reset_recovery(device, ep_out, ep_in)
+        raise
+    return data if len(status) >= _CSW_LENGTH and status[12] == 0 and data else None
 
 
 def _iter_ipods(usb):
@@ -109,11 +152,13 @@ def query_ipod_vpd(usb_pid: int = 0, serial_filter: str = "") -> dict[str, Any] 
         return None
     wanted = str(serial_filter or "").strip().casefold()
     try:
-        device = next((d for d in _iter_ipods(usb) if (not usb_pid or d.idProduct == usb_pid)
+        devices = list(_iter_ipods(usb))
+        device = next((d for d in devices if (not usb_pid or d.idProduct == usb_pid)
                        and (not wanted or _device_serial(usb, d).casefold() == wanted)), None)
     except Exception:
         return None
     if device is None:
+        _dispose(usb, devices)
         return None
     detached = False
     try:
@@ -124,7 +169,7 @@ def query_ipod_vpd(usb_pid: int = 0, serial_filter: str = "") -> dict[str, Any] 
         tags = iter(range(2, 1 << 31))
 
         def inquiry(evpd: bool, page: int, length: int) -> bytes | None:
-            return _bulk_inquiry(ep_out, ep_in, next(tags), evpd, page, length)
+            return _bulk_inquiry(device, ep_out, ep_in, next(tags), evpd, page, length)
 
         payload = read_vpd_payload(inquiry)
         result: dict[str, Any] = {
@@ -147,6 +192,16 @@ def query_ipod_vpd(usb_pid: int = 0, serial_filter: str = "") -> dict[str, Any] 
                 device.attach_kernel_driver(0)
             except Exception:
                 logger.warning("Could not re-attach the iPod kernel driver; reconnect the iPod")
+        _dispose(usb, devices)
+
+
+def _dispose(usb, devices) -> None:
+    """Close what PyUSB opened (it keeps a handle until told): an open handle keeps the iPod busy."""
+    for d in devices:
+        try:
+            usb.util.dispose_resources(d)
+        except Exception:
+            pass
 
 
 def query_all_ipods() -> list[dict[str, Any]]:
@@ -163,7 +218,9 @@ def query_all_ipods() -> list[dict[str, Any]]:
         if index:
             time.sleep(_PAUSE_BETWEEN_DEVICES_S)
         try:
-            found = query_ipod_vpd(int(device.idProduct), _device_serial(usb, device))
+            pid, serial = int(device.idProduct), _device_serial(usb, device)
+            _dispose(usb, [device])
+            found = query_ipod_vpd(pid, serial)
         except PermissionError:
             raise
         except Exception as exc:
@@ -332,10 +389,15 @@ def _find_mount_point_for_usb_serial(usb_serial: str) -> str | None:
             text = subprocess.run(["mount"], capture_output=True, text=True, timeout=10).stdout
         except (OSError, subprocess.SubprocessError):
             return None
+        # `mount` doesn't show the USB serial, so: the one mounted volume that is an iPod.
+        # Any line with "/Volumes/" won't do: /System/Volumes/VM comes first, and the
+        # SysInfo was then "written" there (refused, the iPod's file stayed empty).
+        ipods = []
         for line in text.splitlines():
-            match = re.match(r"^(\S+) on (.+) \(", line)
-            if match and "/Volumes/" in match.group(2):
-                return match.group(2)
+            match = re.match(r"^(\S+) on (/Volumes/.+) \(", line)
+            if match and os.path.isdir(os.path.join(match.group(2), "iPod_Control")):
+                ipods.append(match.group(2))
+        return ipods[0] if len(ipods) == 1 else None
     return None
 
 

@@ -323,7 +323,8 @@ def _identify_ipod_mount(mount_path: str, display_name: str) -> IpodDevice | Non
     filesystem = _probe_filesystem(mount_path)
     _apply_resolution(info, resolve_model(hardware, filesystem, info.disk_size_gb))
     info.raw_identity_evidence = {"hardware": [hardware], "filesystem": [filesystem]}
-    if not info.model_number and info.usb_pid:
+    from podsync.hardware.probes import libusb as libusb_probe
+    if not info.model_number and info.usb_pid and libusb_probe.AUTO_PROBE:
         _apply_live_vpd(info)
     info.ipod_name = read_master_playlist_title(mount_path)
     enrich(info)

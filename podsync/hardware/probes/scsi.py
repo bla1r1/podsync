@@ -55,10 +55,24 @@ def read_vpd_payload(inquiry: InquiryFn) -> bytes:
     """The SysInfoExtended bytes spread over the vendor pages, trailing NULs removed."""
     listing = _ask(inquiry, True, _PAGE_LIST, _PAGE_LENGTH)
     pages = [page for page in _page_payload(listing) if page >= _FIRST_DATA_PAGE] if len(listing) > 4 else []
-    if not pages:
+    listed = bool(pages)
+    if not listed:
         pages = list(range(_FIRST_DATA_PAGE, 0x100))
-    fragments = (_page_payload(_ask(inquiry, True, page, _PAGE_LENGTH)) for page in pages)
-    return b"".join(fragment for fragment in fragments if any(fragment)).rstrip(b"\x00")
+    fragments, misses = [], 0
+    for page in pages:
+        fragment = _page_payload(_ask(inquiry, True, page, _PAGE_LENGTH))
+        if any(fragment):
+            fragments.append(fragment)
+            misses = 0
+            continue
+        misses += 1
+        # Without the page list every page up to 0xFF is tried, and on a device that doesn't
+        # answer each try is a timeout: minutes with the iPod off the system. The fragments
+        # are consecutive, so the first gap after them is the end, and three misses in a row
+        # before any of them means there is nothing to read.
+        if not listed and (fragments or misses >= 3):
+            break
+    return b"".join(fragments).rstrip(b"\x00")
 
 
 def standard_inquiry_strings(inquiry: InquiryFn) -> dict[str, str]:

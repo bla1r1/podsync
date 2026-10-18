@@ -148,9 +148,9 @@ def _looks_like_live_apple_device(info: IpodDevice) -> bool:
 
 def _apply_live_vpd(info: IpodDevice) -> None:
     """Step 2.2: the device's own answer over SCSI; the payload is never cached on the iPod."""
-    if not info.path or "live_vpd" in info.raw_identity_evidence or not _looks_like_live_apple_device(info):
-        return
     from podsync.hardware.probes import libusb as libusb_probe
+    if not libusb_probe.AUTO_PROBE or not info.path or "live_vpd" in info.raw_identity_evidence or not _looks_like_live_apple_device(info):
+        return
 
     try:
         found = libusb_probe.identify_by_vpd(mount_path=info.path, usb_pid=info.usb_pid,
